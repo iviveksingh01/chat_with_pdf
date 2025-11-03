@@ -1,165 +1,164 @@
 import streamlit as st
+st.set_page_config(page_title="Chat With Files", layout="wide")  # 👈 must be first Streamlit command
+
 import os
+import traceback
 from PyPDF2 import PdfReader
 import docx
-from langchain.chat_models import ChatOpenAI
-from langchain.llms import OpenAI
 from dotenv import load_dotenv
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.embeddings.huggingface import HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain import HuggingFaceHub
-from streamlit_chat import message
-from langchain.callbacks import get_openai_callback
 
+# Stable LangChain 0.2+ imports
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 
+# Load environment variables (optional)
+load_dotenv()
 
-# "with" notation
 def main():
-    load_dotenv()
-    st.set_page_config(page_title="Chat With any files")
-    st.header("💬 Chatbot")
+    try:
+        st.header("💬 Chat with PDF/DOCX (Powered by Gemini)")
 
-    if "conversation" not in st.session_state:
-        st.session_state.conversation = None
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = None
-    if "processComplete" not in st.session_state:
-        st.session_state.processComplete = None
+        # Initialize session state
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
+        if "vectorstore" not in st.session_state:
+            st.session_state.vectorstore = None
 
-    with st.sidebar:
-        uploaded_files =  st.file_uploader("Upload your file",type=['pdf','docx'],accept_multiple_files=True)
-        openai_api_key = st.text_input("OpenAI API Key", key="chatbot_api_key", type="password")
-        process = st.button("Process")
-    if process:
-        if not openai_api_key:
-            st.info("Please add your OpenAI API key to continue.")
-            st.stop()
-        files_text = get_files_text(uploaded_files)
-        # get text chunks
-        text_chunks = get_text_chunks(files_text)
-        # create vetore stores
-        vetorestore = get_vectorstore(text_chunks)
-         # create conversation chain
-        st.session_state.conversation = get_conversation_chain(vetorestore,openai_api_key) #for openAI
-        # st.session_state.conversation = get_conversation_chain(vetorestore) #for huggingface
+        with st.sidebar:
+            st.subheader("📁 Upload Documents")
+            uploaded_files = st.file_uploader(
+                "Upload PDF or DOCX files",
+                type=["pdf", "docx"],
+                accept_multiple_files=True
+            )
+            google_api_key = st.text_input(
+                "Google AI Studio API Key",
+                type="password",
+                value=os.getenv("GOOGLE_API_KEY", ""),  # Auto-fill from .env if exists
+                help="Get it from https://aistudio.google.com/app/apikey"
+            )
+            if st.button("🚀 Process Documents"):
+                if not google_api_key.strip():
+                    st.error("❌ Please enter your Google API key.")
+                elif not uploaded_files:
+                    st.error("❌ Please upload at least one file.")
+                else:
+                    try:
+                        with st.spinner("🔧 Processing documents..."):
+                            raw_text = get_files_text(uploaded_files)
+                            if not raw_text.strip():
+                                st.warning("⚠️ No text found in the uploaded files.")
+                                st.session_state.vectorstore = None
+                                return
+                            text_chunks = get_text_chunks(raw_text)
+                            if not text_chunks:
+                                st.error("❌ Failed to split text into chunks.")
+                                return
+                            vectorstore = get_vectorstore(text_chunks)
+                            st.session_state.vectorstore = vectorstore
+                        st.success("✅ Documents processed successfully!")
+                    except Exception as e:
+                        st.error(f"💥 Error during processing: {str(e)}")
+                        st.code(traceback.format_exc())
 
-        st.session_state.processComplete = True
+        # Chat interface
+        if st.session_state.vectorstore is not None:
+            user_question = st.chat_input("Ask a question about your documents...")
+            if user_question:
+                try:
+                    with st.spinner("🤔 Thinking..."):
+                        response = get_gemini_response(
+                            user_question,
+                            st.session_state.vectorstore,
+                            google_api_key.strip()
+                        )
+                    st.session_state.chat_history.append({"role": "user", "content": user_question})
+                    st.session_state.chat_history.append({"role": "assistant", "content": response})
+                except Exception as e:
+                    st.error(f"💥 Error generating response: {str(e)}")
+                    st.code(traceback.format_exc())
 
-    if  st.session_state.processComplete == True:
-        user_question = st.chat_input("Ask Question about your files.")
-        if user_question:
-            handel_userinput(user_question)
+            # Display chat history
+            for msg in st.session_state.chat_history:
+                with st.chat_message(msg["role"]):
+                    st.write(msg["content"])
+        else:
+            st.info("👈 Upload and process your documents to start chatting!")
 
+    except Exception as e:
+        st.error("🚨 An unexpected error occurred in the main function:")
+        st.code(traceback.format_exc())
 
-
-
+# === Helper Functions ===
 
 def get_files_text(uploaded_files):
     text = ""
-    for uploaded_file in uploaded_files:
-        split_tup = os.path.splitext(uploaded_file.name)
-        file_extension = split_tup[1]
-        if file_extension == ".pdf":
-            text += get_pdf_text(uploaded_file)
-        elif file_extension == ".docx":
-            text += get_docx_text(uploaded_file)
-        else:
-            text += get_csv_text(uploaded_file)
+    for file in uploaded_files:
+        ext = os.path.splitext(file.name)[1].lower()
+        if ext == ".pdf":
+            text += get_pdf_text(file)
+        elif ext == ".docx":
+            text += get_docx_text(file)
     return text
-
 
 def get_pdf_text(pdf):
-    pdf_reader = PdfReader(pdf)
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text()
-    return text
+    reader = PdfReader(pdf)
+    return "".join(page.extract_text() or "" for page in reader.pages)
 
 def get_docx_text(file):
     doc = docx.Document(file)
-    allText = []
-    for docpara in doc.paragraphs:
-        allText.append(docpara.text)
-    text = ' '.join(allText)
-    return text
-
-def get_csv_text(file):
-    return "a"
+    return " ".join(para.text for para in doc.paragraphs if para.text.strip())
 
 def get_text_chunks(text):
-    # spilit ito chuncks
-    text_splitter = CharacterTextSplitter(
-        separator="\n",
-        chunk_size=900,
-        chunk_overlap=100,
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
         length_function=len
     )
     chunks = text_splitter.split_text(text)
     return chunks
 
-
 def get_vectorstore(text_chunks):
-    embeddings = HuggingFaceEmbeddings()
-    # embeddings = HuggingFaceInstructEmbeddings(model_name="hkunlp/instructor-xl")
-    knowledge_base = FAISS.from_texts(text_chunks,embeddings)
-    return knowledge_base
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    return FAISS.from_texts(text_chunks, embeddings)
 
-def get_conversation_chain(vetorestore,openai_api_key):
-    llm = ChatOpenAI(openai_api_key=openai_api_key, model_name = 'gpt-3.5-turbo',temperature=0)
-    memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True)
-    conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vetorestore.as_retriever(),
-        memory=memory
+def get_gemini_response(question, vectorstore, api_key):
+    if not api_key:
+        raise ValueError("Google API key is missing.")
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    llm = ChatGoogleGenerativeAI(
+        model="models/gemini-pro-latest",
+        google_api_key=api_key,
+        temperature=0.3
     )
-    return conversation_chain
 
+    prompt = ChatPromptTemplate.from_template(
+        """You are a helpful assistant. Use ONLY the following context to answer the question.
+        If the answer is not in the context, say: "I don't know based on the provided documents."
 
-# def get_conversation_chain(vetorestore):
-#     llm = HuggingFaceHub(repo_id="google/flan-t5-large", model_kwargs={"temperature":5,
-#                                                       "max_length":64})
-#     memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True)
-#     conversation_chain = ConversationalRetrievalChain.from_llm(
-#         llm=llm,
-#         retriever=vetorestore.as_retriever(),
-#         memory=memory
-#     )
-#     return conversation_chain
+        Context:
+        {context}
 
-def handel_userinput(user_question):
-    with get_openai_callback() as cb:
-        response = st.session_state.conversation({'question':user_question})
-    st.session_state.chat_history = response['chat_history']
+        Question: {question}
+        Answer:"""
+    )
 
-    # Layout of input/response containers
-    response_container = st.container()
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
 
-    with response_container:
-        for i, messages in enumerate(st.session_state.chat_history):
-            if i % 2 == 0:
-                message(messages.content, is_user=True, key=str(i))
-            else:
-                message(messages.content, key=str(i))
-        st.write(f"Total Tokens: {cb.total_tokens}" f", Prompt Tokens: {cb.prompt_tokens}" f", Completion Tokens: {cb.completion_tokens}" f", Total Cost (USD): ${cb.total_cost}")
+    rag_chain = (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    return rag_chain.invoke(question)
 
-                 # for i, message in enumerate(st.session_state.chat_history):
-    #     if i % 2 == 0:
-    #         st.write(user_template.replace("{{MSG}}",message.content),unsafe_allow_html=True)
-    #     else:
-    #         st.write(bot_template.replace("{{MSG}}",message.content),unsafe_allow_html=True)
-
-
-
-
-
+# --- Run App ---
 if __name__ == '__main__':
     main()
-
-
-
-
-
-
