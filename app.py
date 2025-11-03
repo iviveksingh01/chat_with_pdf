@@ -16,8 +16,23 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
-# Load environment variables (optional)
+# Load environment variables (for local development only)
 load_dotenv()
+
+def get_google_api_key():
+    """Get API key from Streamlit Secrets (preferred) or .env (local fallback)."""
+    try:
+        return st.secrets["GOOGLE_API_KEY"]
+    except KeyError:
+        # Fallback for local development
+        api_key = os.getenv("GOOGLE_API_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "Google API key not found. "
+                "When running locally, set it in a `.env` file. "
+                "When deployed on Streamlit Cloud, add it to Secrets."
+            )
+        return api_key
 
 def main():
     try:
@@ -36,35 +51,36 @@ def main():
                 type=["pdf", "docx"],
                 accept_multiple_files=True
             )
-            google_api_key = st.text_input(
-                "Google AI Studio API Key",
-                type="password",
-                value=os.getenv("GOOGLE_API_KEY", ""),  # Auto-fill from .env if exists
-                help="Get it from https://aistudio.google.com/app/apikey"
-            )
+
             if st.button("🚀 Process Documents"):
-                if not google_api_key.strip():
-                    st.error("❌ Please enter your Google API key.")
-                elif not uploaded_files:
+                if not uploaded_files:
                     st.error("❌ Please upload at least one file.")
-                else:
-                    try:
-                        with st.spinner("🔧 Processing documents..."):
-                            raw_text = get_files_text(uploaded_files)
-                            if not raw_text.strip():
-                                st.warning("⚠️ No text found in the uploaded files.")
-                                st.session_state.vectorstore = None
-                                return
-                            text_chunks = get_text_chunks(raw_text)
-                            if not text_chunks:
-                                st.error("❌ Failed to split text into chunks.")
-                                return
-                            vectorstore = get_vectorstore(text_chunks)
-                            st.session_state.vectorstore = vectorstore
-                        st.success("✅ Documents processed successfully!")
-                    except Exception as e:
-                        st.error(f"💥 Error during processing: {str(e)}")
-                        st.code(traceback.format_exc())
+                    return
+
+                try:
+                    # Securely get API key
+                    google_api_key = get_google_api_key()
+                except ValueError as e:
+                    st.error(f"🔑 {str(e)}")
+                    st.stop()
+
+                try:
+                    with st.spinner("🔧 Processing documents..."):
+                        raw_text = get_files_text(uploaded_files)
+                        if not raw_text.strip():
+                            st.warning("⚠️ No text found in the uploaded files.")
+                            st.session_state.vectorstore = None
+                            return
+                        text_chunks = get_text_chunks(raw_text)
+                        if not text_chunks:
+                            st.error("❌ Failed to split text into chunks.")
+                            return
+                        vectorstore = get_vectorstore(text_chunks)
+                        st.session_state.vectorstore = vectorstore
+                    st.success("✅ Documents processed successfully!")
+                except Exception as e:
+                    st.error(f"💥 Error during processing: {str(e)}")
+                    st.code(traceback.format_exc())
 
         # Chat interface
         if st.session_state.vectorstore is not None:
@@ -74,8 +90,7 @@ def main():
                     with st.spinner("🤔 Thinking..."):
                         response = get_gemini_response(
                             user_question,
-                            st.session_state.vectorstore,
-                            google_api_key.strip()
+                            st.session_state.vectorstore
                         )
                     st.session_state.chat_history.append({"role": "user", "content": user_question})
                     st.session_state.chat_history.append({"role": "assistant", "content": response})
@@ -127,9 +142,13 @@ def get_vectorstore(text_chunks):
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     return FAISS.from_texts(text_chunks, embeddings)
 
-def get_gemini_response(question, vectorstore, api_key):
-    if not api_key:
-        raise ValueError("Google API key is missing.")
+def get_gemini_response(question, vectorstore):
+    # API key is fetched securely inside this function
+    try:
+        api_key = get_google_api_key()
+    except ValueError as e:
+        raise RuntimeError(str(e))
+
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
     llm = ChatGoogleGenerativeAI(
         model="models/gemini-pro-latest",
