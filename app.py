@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import pytesseract
 from pdf2image import convert_from_path
 import tempfile
+import shutil  # for tesseract auto-detect
 
 # LangChain imports
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -22,13 +23,19 @@ from langchain_core.output_parsers import StrOutputParser
 # Load .env
 load_dotenv()
 
-# Set Tesseract path (Windows)
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# ------------------------------------------------------
+#   TESSERACT AUTO-DETECTION (Linux/Windows/Mac Safe)
+# ------------------------------------------------------
+tesseract_path = shutil.which("tesseract")
+if tesseract_path:
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+else:
+    print("⚠️ Warning: Tesseract not found in PATH.")
 
 
-# =====================================================
-#                GOOGLE API KEY LOADER
-# =====================================================
+# ------------------------------------------------------
+#   GOOGLE API KEY
+# ------------------------------------------------------
 def get_google_api_key():
     try:
         return st.secrets["GOOGLE_API_KEY"]
@@ -39,27 +46,26 @@ def get_google_api_key():
         return api_key
 
 
-# =====================================================
-#                PDF + OCR EXTRACTION
-# =====================================================
+# ------------------------------------------------------
+#   PDF + OCR
+# ------------------------------------------------------
 def extract_text_from_pdf_with_ocr(pdf_path):
     """
-    1. Try normal text extraction
-    2. If almost no text found → run OCR on the scanned pages
+    1. Try PyPDF2 extraction.
+    2. If text is too small, perform full OCR.
     """
-    text = ""
     reader = PdfReader(pdf_path)
     page_texts = []
 
-    # Try normal PDF text extraction
     for page in reader.pages:
-        content = page.extract_text() or ""
-        page_texts.append(content)
+        txt = page.extract_text() or ""
+        page_texts.append(txt)
 
-    if sum(len(t) for t in page_texts) > 50:  # Text PDF
+    # If searchable text exists
+    if sum(len(t) for t in page_texts) > 50:
         return "\n".join(page_texts)
 
-    # Otherwise → OCR fallback
+    # Otherwise OCR
     ocr_text = ""
     images = convert_from_path(pdf_path, dpi=300)
 
@@ -69,9 +75,9 @@ def extract_text_from_pdf_with_ocr(pdf_path):
     return ocr_text
 
 
-# =====================================================
-#                FILE TEXT EXTRACTOR
-# =====================================================
+# ------------------------------------------------------
+#   Extract docx + PDF
+# ------------------------------------------------------
 def get_files_text(uploaded_files):
     text = ""
 
@@ -79,14 +85,14 @@ def get_files_text(uploaded_files):
         ext = os.path.splitext(file.name)[1].lower()
 
         if ext == ".pdf":
-            # save uploaded PDF to temp file
+            # Save temp PDF
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(file.getvalue())
                 tmp_path = tmp.name
 
             text += extract_text_from_pdf_with_ocr(tmp_path)
 
-            os.unlink(tmp_path)  # cleanup
+            os.unlink(tmp_path)
 
         elif ext == ".docx":
             text += get_docx_text(file)
@@ -99,14 +105,12 @@ def get_docx_text(file):
     return " ".join(para.text for para in doc.paragraphs if para.text.strip())
 
 
-# =====================================================
-#           TEXT CHUNKING & VECTOR STORE
-# =====================================================
+# ------------------------------------------------------
+#   Chunk + VectorStore
+# ------------------------------------------------------
 def get_text_chunks(text):
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
+        chunk_size=1000, chunk_overlap=200, length_function=len
     )
     return splitter.split_text(text)
 
@@ -118,9 +122,9 @@ def get_vectorstore(text_chunks):
     return FAISS.from_texts(text_chunks, embeddings)
 
 
-# =====================================================
-#                   GEMINI RESPONSE
-# =====================================================
+# ------------------------------------------------------
+#   Gemini RAG Response
+# ------------------------------------------------------
 def get_gemini_response(question, vectorstore):
     api_key = get_google_api_key()
 
@@ -129,13 +133,12 @@ def get_gemini_response(question, vectorstore):
     llm = ChatGoogleGenerativeAI(
         model="models/gemini-pro-latest",
         google_api_key=api_key,
-        temperature=0.3
+        temperature=0.3,
     )
 
     prompt = ChatPromptTemplate.from_template("""
-You are a helpful assistant. Use ONLY the given context to answer.
-
-If the answer is not found in the documents, reply:
+You are a helpful assistant. Use ONLY the context to answer.
+If the answer isn't found, reply:
 "I don't know based on the provided documents."
 
 Context:
@@ -150,10 +153,7 @@ Answer:
         return "\n\n".join(doc.page_content for doc in docs)
 
     rag_chain = (
-        {
-            "context": retriever | format_docs,
-            "question": RunnablePassthrough()
-        }
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
         | prompt
         | llm
         | StrOutputParser()
@@ -162,14 +162,15 @@ Answer:
     return rag_chain.invoke(question)
 
 
-# =====================================================
-#                       MAIN UI
-# =====================================================
+# ------------------------------------------------------
+#                  MAIN STREAMLIT APP
+# ------------------------------------------------------
 def main():
     st.header("💬 Chat with PDF / Scanned PDF / DOCX (Gemini RAG)")
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
+
     if "vectorstore" not in st.session_state:
         st.session_state.vectorstore = None
 
@@ -177,38 +178,37 @@ def main():
     with st.sidebar:
         st.subheader("📁 Upload Files")
         uploaded_files = st.file_uploader(
-            "Upload PDF or DOCX files",
+            "Upload PDF or DOCX",
             type=["pdf", "docx"],
             accept_multiple_files=True
         )
 
         if st.button("🚀 Process Documents"):
             if not uploaded_files:
-                st.error("❌ Please upload at least one file.")
+                st.error("Please upload at least one document.")
                 return
 
             try:
                 get_google_api_key()
             except ValueError as e:
                 st.error(str(e))
-                st.stop()
+                return
 
             try:
-                with st.spinner("🔧 Extracting & Processing..."):
+                with st.spinner("Extracting & Processing..."):
                     raw_text = get_files_text(uploaded_files)
 
                     if not raw_text.strip():
-                        st.warning("⚠️ No readable text found.")
+                        st.warning("⚠ No readable text found.")
                         return
 
                     chunks = get_text_chunks(raw_text)
-                    vectorstore = get_vectorstore(chunks)
-                    st.session_state.vectorstore = vectorstore
+                    st.session_state.vectorstore = get_vectorstore(chunks)
 
                 st.success("✅ Documents processed successfully!")
 
             except Exception as e:
-                st.error(f"Error while processing: {str(e)}")
+                st.error(f"Error: {str(e)}")
                 st.code(traceback.format_exc())
 
     # Chat Area
@@ -217,25 +217,20 @@ def main():
 
         if user_question:
             with st.spinner("🤔 Thinking..."):
-                response = get_gemini_response(
+                answer = get_gemini_response(
                     user_question,
                     st.session_state.vectorstore
                 )
 
-            st.session_state.chat_history.append(
-                {"role": "user", "content": user_question}
-            )
-            st.session_state.chat_history.append(
-                {"role": "assistant", "content": response}
-            )
+            st.session_state.chat_history.append({"role": "user", "content": user_question})
+            st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
-        # Display conversation
         for msg in st.session_state.chat_history:
             with st.chat_message(msg["role"]):
                 st.write(msg["content"])
 
     else:
-        st.info("👈 Upload & Process documents to start chatting!")
+        st.info("👈 Please upload documents to begin.")
 
 
 if __name__ == "__main__":
