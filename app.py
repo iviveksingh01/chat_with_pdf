@@ -1,17 +1,13 @@
 import streamlit as st
-st.set_page_config(page_title="Chat With Files", layout="wide")
+st.set_page_config(page_title="Chat With Files", layout="wide")  # 👈 must be first Streamlit command
 
 import os
 import traceback
 from PyPDF2 import PdfReader
 import docx
 from dotenv import load_dotenv
-import pytesseract
-from pdf2image import convert_from_path
-import tempfile
-import shutil  # for tesseract auto-detect
 
-# LangChain imports
+# Stable LangChain 0.2+ imports
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -20,134 +16,156 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
-# Load .env
+# Load environment variables (for local development only)
 load_dotenv()
 
-# ------------------------------------------------------
-#   TESSERACT AUTO-DETECTION (Linux/Windows/Mac Safe)
-# ------------------------------------------------------
-tesseract_path = shutil.which("tesseract")
-if tesseract_path:
-    pytesseract.pytesseract.tesseract_cmd = tesseract_path
-else:
-    print("⚠️ Warning: Tesseract not found in PATH.")
-
-
-# ------------------------------------------------------
-#   GOOGLE API KEY
-# ------------------------------------------------------
 def get_google_api_key():
+    """Get API key from Streamlit Secrets (preferred) or .env (local fallback)."""
     try:
         return st.secrets["GOOGLE_API_KEY"]
     except KeyError:
+        # Fallback for local development
         api_key = os.getenv("GOOGLE_API_KEY", "")
         if not api_key:
-            raise ValueError("Google API key not found in Secrets or .env")
+            raise ValueError(
+                "Google API key not found. "
+                "When running locally, set it in a `.env` file. "
+                "When deployed on Streamlit Cloud, add it to Secrets."
+            )
         return api_key
 
+def main():
+    try:
+        st.header("💬 Chat with PDF/DOCX (Powered by Gemini)")
 
-# ------------------------------------------------------
-#   PDF + OCR
-# ------------------------------------------------------
-def extract_text_from_pdf_with_ocr(pdf_path):
-    """
-    1. Try PyPDF2 extraction.
-    2. If text is too small, perform full OCR.
-    """
-    reader = PdfReader(pdf_path)
-    page_texts = []
+        # Initialize session state
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
+        if "vectorstore" not in st.session_state:
+            st.session_state.vectorstore = None
 
-    for page in reader.pages:
-        txt = page.extract_text() or ""
-        page_texts.append(txt)
+        with st.sidebar:
+            st.subheader("📁 Upload Documents")
+            uploaded_files = st.file_uploader(
+                "Upload PDF or DOCX files",
+                type=["pdf", "docx"],
+                accept_multiple_files=True
+            )
 
-    # If searchable text exists
-    if sum(len(t) for t in page_texts) > 50:
-        return "\n".join(page_texts)
+            if st.button("🚀 Process Documents"):
+                if not uploaded_files:
+                    st.error("❌ Please upload at least one file.")
+                    return
 
-    # Otherwise OCR
-    ocr_text = ""
-    images = convert_from_path(pdf_path, dpi=300)
+                try:
+                    # Securely get API key
+                    google_api_key = get_google_api_key()
+                except ValueError as e:
+                    st.error(f"🔑 {str(e)}")
+                    st.stop()
 
-    for img in images:
-        ocr_text += pytesseract.image_to_string(img, lang="eng") + "\n"
+                try:
+                    with st.spinner("🔧 Processing documents..."):
+                        raw_text = get_files_text(uploaded_files)
+                        if not raw_text.strip():
+                            st.warning("⚠️ No text found in the uploaded files.")
+                            st.session_state.vectorstore = None
+                            return
+                        text_chunks = get_text_chunks(raw_text)
+                        if not text_chunks:
+                            st.error("❌ Failed to split text into chunks.")
+                            return
+                        vectorstore = get_vectorstore(text_chunks)
+                        st.session_state.vectorstore = vectorstore
+                    st.success("✅ Documents processed successfully!")
+                except Exception as e:
+                    st.error(f"💥 Error during processing: {str(e)}")
+                    st.code(traceback.format_exc())
 
-    return ocr_text
+        # Chat interface
+        if st.session_state.vectorstore is not None:
+            user_question = st.chat_input("Ask a question about your documents...")
+            if user_question:
+                try:
+                    with st.spinner("🤔 Thinking..."):
+                        response = get_gemini_response(
+                            user_question,
+                            st.session_state.vectorstore
+                        )
+                    st.session_state.chat_history.append({"role": "user", "content": user_question})
+                    st.session_state.chat_history.append({"role": "assistant", "content": response})
+                except Exception as e:
+                    st.error(f"💥 Error generating response: {str(e)}")
+                    st.code(traceback.format_exc())
 
+            # Display chat history
+            for msg in st.session_state.chat_history:
+                with st.chat_message(msg["role"]):
+                    st.write(msg["content"])
+        else:
+            st.info("👈 Upload and process your documents to start chatting!")
 
-# ------------------------------------------------------
-#   Extract docx + PDF
-# ------------------------------------------------------
+    except Exception as e:
+        st.error("🚨 An unexpected error occurred in the main function:")
+        st.code(traceback.format_exc())
+
+# === Helper Functions ===
+
 def get_files_text(uploaded_files):
     text = ""
-
     for file in uploaded_files:
         ext = os.path.splitext(file.name)[1].lower()
-
         if ext == ".pdf":
-            # Save temp PDF
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(file.getvalue())
-                tmp_path = tmp.name
-
-            text += extract_text_from_pdf_with_ocr(tmp_path)
-
-            os.unlink(tmp_path)
-
+            text += get_pdf_text(file)
         elif ext == ".docx":
             text += get_docx_text(file)
-
     return text
 
+def get_pdf_text(pdf):
+    reader = PdfReader(pdf)
+    return "".join(page.extract_text() or "" for page in reader.pages)
 
 def get_docx_text(file):
     doc = docx.Document(file)
     return " ".join(para.text for para in doc.paragraphs if para.text.strip())
 
-
-# ------------------------------------------------------
-#   Chunk + VectorStore
-# ------------------------------------------------------
 def get_text_chunks(text):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000, chunk_overlap=200, length_function=len
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len
     )
-    return splitter.split_text(text)
-
+    chunks = text_splitter.split_text(text)
+    return chunks
 
 def get_vectorstore(text_chunks):
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     return FAISS.from_texts(text_chunks, embeddings)
 
-
-# ------------------------------------------------------
-#   Gemini RAG Response
-# ------------------------------------------------------
 def get_gemini_response(question, vectorstore):
-    api_key = get_google_api_key()
+    # API key is fetched securely inside this function
+    try:
+        api_key = get_google_api_key()
+    except ValueError as e:
+        raise RuntimeError(str(e))
 
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-
     llm = ChatGoogleGenerativeAI(
         model="models/gemini-pro-latest",
         google_api_key=api_key,
-        temperature=0.3,
+        temperature=0.3
     )
 
-    prompt = ChatPromptTemplate.from_template("""
-You are a helpful assistant. Use ONLY the context to answer.
-If the answer isn't found, reply:
-"I don't know based on the provided documents."
+    prompt = ChatPromptTemplate.from_template(
+        """You are a helpful assistant. Use ONLY the following context to answer the question.
+        If the answer is not in the context, say: "I don't know based on the provided documents."
 
-Context:
-{context}
+        Context:
+        {context}
 
-Question: {question}
-
-Answer:
-""")
+        Question: {question}
+        Answer:"""
+    )
 
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
@@ -158,80 +176,8 @@ Answer:
         | llm
         | StrOutputParser()
     )
-
     return rag_chain.invoke(question)
 
-
-# ------------------------------------------------------
-#                  MAIN STREAMLIT APP
-# ------------------------------------------------------
-def main():
-    st.header("💬 Chat with PDF / Scanned PDF / DOCX (Gemini RAG)")
-
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-
-    if "vectorstore" not in st.session_state:
-        st.session_state.vectorstore = None
-
-    # Sidebar
-    with st.sidebar:
-        st.subheader("📁 Upload Files")
-        uploaded_files = st.file_uploader(
-            "Upload PDF or DOCX",
-            type=["pdf", "docx"],
-            accept_multiple_files=True
-        )
-
-        if st.button("🚀 Process Documents"):
-            if not uploaded_files:
-                st.error("Please upload at least one document.")
-                return
-
-            try:
-                get_google_api_key()
-            except ValueError as e:
-                st.error(str(e))
-                return
-
-            try:
-                with st.spinner("Extracting & Processing..."):
-                    raw_text = get_files_text(uploaded_files)
-
-                    if not raw_text.strip():
-                        st.warning("⚠ No readable text found.")
-                        return
-
-                    chunks = get_text_chunks(raw_text)
-                    st.session_state.vectorstore = get_vectorstore(chunks)
-
-                st.success("✅ Documents processed successfully!")
-
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
-                st.code(traceback.format_exc())
-
-    # Chat Area
-    if st.session_state.vectorstore:
-        user_question = st.chat_input("Ask something from your documents...")
-
-        if user_question:
-            with st.spinner("🤔 Thinking..."):
-                answer = get_gemini_response(
-                    user_question,
-                    st.session_state.vectorstore
-                )
-
-            st.session_state.chat_history.append({"role": "user", "content": user_question})
-            st.session_state.chat_history.append({"role": "assistant", "content": answer})
-
-        for msg in st.session_state.chat_history:
-            with st.chat_message(msg["role"]):
-                st.write(msg["content"])
-
-    else:
-        st.info("👈 Please upload documents to begin.")
-
-
-if __name__ == "__main__":
+# --- Run App ---
+if __name__ == '__main__':
     main()
